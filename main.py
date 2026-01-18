@@ -180,7 +180,7 @@ if not parks:
 
 with st.sidebar:
     st.header("Filtros")
-    park_selected = st.selectbox("Park", options=parks, index=0)
+    park_selected = st.selectbox("Park", options=parks, index=1)
 
     rides = get_rides_for_park_from_df(df_all, park_selected)
     if not rides:
