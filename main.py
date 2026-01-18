@@ -29,6 +29,29 @@ def floor_to_30min_hhmm(hhmm: str) -> str:
     except Exception:
         return hhmm[:5]
 
+def classify_wait(wait_now, avg, p25, p75, tol=2):
+    """
+    Regras:
+      - wait_now > p75  -> Muito ruim
+      - avg < wait_now <= p75 -> Ruim
+      - wait_now == avg (± tol) -> Médio
+      - p25 < wait_now < avg -> Bom
+      - wait_now <= p25 -> Muito bom
+    """
+    if pd.isna(wait_now) or pd.isna(avg) or pd.isna(p25) or pd.isna(p75):
+        return "Sem dados", "⚪"
+
+    if wait_now > p75:
+        return "Muito ruim", "🔴"
+    elif wait_now > avg:
+        return "Ruim", "🟠"
+    elif abs(wait_now - avg) <= tol:
+        return "Médio", "🟡"
+    elif wait_now > p25:
+        return "Bom", "🟢"
+    else:
+        return "Muito bom", "🟢🟢"
+
 # -----------------------------
 # CSV (histórico agregados)
 # -----------------------------
@@ -111,11 +134,12 @@ def build_live_dfs_for_park(park_id: int) -> dict:
     for land in (payload.get("lands") or []):
         land_name = land.get("name")
         for ride in (land.get("rides") or []):
+            hhmm = ts_florida_dt.strftime("%H:%M")
             rides_rows.append({
                 "ts_utc": ts_utc_iso,
                 "ts_florida": ts_florida_dt,
-                "hora_florida": ts_florida_dt.strftime("%H:%M"),
-                "hora_florida_bucket": floor_to_30min_hhmm(ts_florida_dt.strftime("%H:%M")),
+                "hora_florida": hhmm,
+                "hora_florida_bucket": floor_to_30min_hhmm(hhmm),
                 "park_id": park_id,
                 "land": land_name,
                 "ride_id": ride.get("id"),
@@ -150,18 +174,34 @@ if missing:
     st.stop()
 
 parks = get_parks_from_df(df_all)
+if not parks:
+    st.error("Nenhum park_name encontrado no CSV.")
+    st.stop()
+
 with st.sidebar:
     st.header("Filtros")
     park_selected = st.selectbox("Park", options=parks, index=0)
+
     rides = get_rides_for_park_from_df(df_all, park_selected)
+    if not rides:
+        st.warning("Nenhum ride encontrado para este park no CSV.")
+        st.stop()
+
     ride_filter_text = st.text_input("Filtrar rides (opcional)", value="").strip().lower()
     ride_options = [r for r in rides if ride_filter_text in r.lower()] if ride_filter_text else rides
     if not ride_options:
         ride_options = rides
+
     ride_selected = st.selectbox("Ride", options=ride_options, index=0)
+
     limit_rows = st.slider("Limite de linhas", min_value=50, max_value=2000, value=500, step=50)
 
-# HISTÓRICO (CSV)
+    st.divider()
+    st.caption("Classificação: >P75=muito ruim; avg–P75=ruim; ~=avg=médio; P25–avg=bom; <=P25=muito bom.")
+
+# -----------------------------
+# HISTÓRICO (CSV) do ride selecionado
+# -----------------------------
 df = df_all[(df_all["park_name"] == park_selected) & (df_all["ride_name"] == ride_selected)].copy()
 if df.empty:
     st.warning("Nenhum dado encontrado para o park/ride selecionados no CSV.")
@@ -170,22 +210,89 @@ if df.empty:
 df = df.sort_values(["park_name", "land", "ride_name", "hora_dt"]).head(int(limit_rows))
 df["hora_str"] = df["hora_dt"].dt.strftime("%H:%M")
 
-# LIVE (por park_id) em cache
+# -----------------------------
+# LIVE (por park_id) em cache + classificação geral
+# -----------------------------
+df_live_join = pd.DataFrame()
 df_live_ride_now = pd.DataFrame()
+df_class = None  # classificação de todos os rides do parque (ao vivo)
+
 park_id_selected = get_park_id_from_csv(df_all, park_selected)
 if park_id_selected is not None:
     live = build_live_dfs_for_park(park_id_selected)
     df_live_join = live["df_join"]
     df_live_ride_now = df_live_join[df_live_join["ride_name"] == ride_selected].copy()
 
-with st.expander("📡 Fila agora (ao vivo)", expanded=True):
-    if df_live_ride_now.empty:
-        st.warning("Não achei esse ride no retorno ao vivo.")
-    else:
-        r0 = df_live_ride_now.iloc[0]
-        st.metric("Wait agora (min)", value="—" if pd.isna(r0.get("wait_min")) else int(r0["wait_min"]))
-        st.caption(f"Hora Florida (UTC-5): {r0.get('hora_florida')} | Bucket: {r0.get('hora_florida_bucket')}")
+    # baseline do CSV por ride (no parque selecionado)
+    baseline = (
+        df_all[df_all["park_name"] == park_selected]
+        .groupby("ride_name", as_index=False)
+        .agg(
+            avg_wait=("avg_wait", "mean"),
+            p25_wait=("p25_wait", "mean"),
+            p75_wait=("p75_wait", "mean"),
+        )
+    )
 
+    # junta live + baseline e classifica
+    df_class = df_live_join.merge(baseline, on="ride_name", how="left")
+    df_class["classificacao"] = df_class.apply(
+        lambda r: classify_wait(r.get("wait_min"), r.get("avg_wait"), r.get("p25_wait"), r.get("p75_wait"))[0],
+        axis=1
+    )
+    df_class["icon"] = df_class.apply(
+        lambda r: classify_wait(r.get("wait_min"), r.get("avg_wait"), r.get("p25_wait"), r.get("p75_wait"))[1],
+        axis=1
+    )
+
+with st.expander("📡 Fila agora (ao vivo) + classificação do parque", expanded=True):
+    if park_id_selected is None:
+        st.warning("Não encontrei park_id no CSV para esse park_name, então não dá pra puxar a fila ao vivo por park_id.")
+    else:
+        c1, c2 = st.columns([1, 1])
+
+        with c1:
+            if df_live_ride_now.empty:
+                st.warning("Não achei esse ride no retorno ao vivo.")
+            else:
+                r0 = df_live_ride_now.iloc[0]
+                wait_now = r0.get("wait_min")
+                hhmm = r0.get("hora_florida")
+                bucket = r0.get("hora_florida_bucket")
+
+                st.metric("Wait agora (min)", value="—" if pd.isna(wait_now) else int(wait_now))
+                st.write(f"**Hora Florida (UTC-5):** {hhmm}  |  **Bucket:** {bucket}")
+                st.write(f"**Aberto agora?** {'Sim' if int(r0.get('is_open', 0)) == 1 else 'Não'}")
+                if pd.notna(r0.get("last_updated")):
+                    st.caption(f"Última atualização (API): {r0.get('last_updated')}")
+
+                # classificação do ride selecionado (usando baseline do CSV)
+                if df_class is not None and not df_class.empty:
+                    rr = df_class[df_class["ride_name"] == ride_selected]
+                    if not rr.empty:
+                        rr0 = rr.iloc[0]
+                        label, icon = classify_wait(
+                            rr0.get("wait_min"), rr0.get("avg_wait"), rr0.get("p25_wait"), rr0.get("p75_wait")
+                        )
+                        st.markdown(f"### {icon} {label}")
+
+        with c2:
+            st.subheader("Rides com pior fila agora")
+            if df_class is None or df_class.empty:
+                st.info("Classificação indisponível.")
+            else:
+                # ordena por pior (wait maior)
+                df_show = (
+                    df_class[["icon", "ride_name", "land", "wait_min", "classificacao"]]
+                    .dropna(subset=["wait_min"])
+                    .sort_values("wait_min", ascending=False)
+                    .head(20)
+                )
+                st.dataframe(df_show, use_container_width=True, height=380)
+
+# -----------------------------
+# HISTÓRICO + gráfico (igual ao que você tinha) + PONTO AGORA
+# -----------------------------
 #st.subheader("Histórico agregado (07:00–23:00)")
 #st.dataframe(df, use_container_width=True, height=240)
 
@@ -228,13 +335,13 @@ fig = fig_band
 for trace in fig_lines.data:
     fig.add_trace(trace)
 
-# PONTO "AGORA" (alinhado ao bucket de 30 min do eixo)
+# PONTO "AGORA" alinhado ao bucket de 30 min do eixo
 if not df_live_ride_now.empty:
     r0 = df_live_ride_now.iloc[0]
     wait_now = r0.get("wait_min")
-    bucket = r0.get("hora_florida_bucket")  # <- 11:27 vira 11:00 (ou 11:30)
+    bucket = r0.get("hora_florida_bucket")  # ex: 11:27 -> 11:00
 
-    # Só plota se o bucket existir no eixo do histórico (evita ficar "fora")
+    # Só plota se o bucket existir no eixo do histórico
     if pd.notna(wait_now) and isinstance(bucket, str) and bucket in set(df["hora_str"].unique()):
         df_now_point = pd.DataFrame([{
             "hora_str": bucket,
