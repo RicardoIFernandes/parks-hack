@@ -262,6 +262,7 @@ with st.expander("📡 Agora (ao vivo) + classificação", expanded=True):
                     df_class[["icon", "ride_name", "wait_min", "classificacao"]]
                     .dropna(subset=["wait_min"])
                     .sort_values("wait_min", ascending=False)
+                    .set_index("wait_min")
                     
                 )
                 st.dataframe(df_show, use_container_width=True, height=280)
