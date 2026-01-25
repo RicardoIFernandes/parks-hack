@@ -2,3 +2,4 @@ pandas
 streamlit
 plotly
 requests
+altair==4.2.2
